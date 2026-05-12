@@ -42,7 +42,6 @@ spec:
       containers:
       - name: backend-container
         image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_BACKEND_REPOSITORY_NAME}:${BITBUCKET_TAG}
-        # image: 358294946102.dkr.ecr.eu-west-2.amazonaws.com/fashion-backend-ecr-repo:v1.1.2
         ports:
         - containerPort: 5000
         env:
@@ -131,7 +130,6 @@ spec:
       containers:
       - name: frontend-container
         image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_FRONTEND_REPOSITORY_NAME}:${BITBUCKET_TAG}
-        # image: 358294946102.dkr.ecr.eu-west-2.amazonaws.com/fashion-frontend-ecr-repo:v1.1.2
         ports:
         - containerPort: 8080
         env:

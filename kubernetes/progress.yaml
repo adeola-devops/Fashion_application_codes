@@ -24,7 +24,7 @@ metadata:
   namespace: fashion-store-project
 type: Opaque
 stringData:
-  password: ${POSTGRES_PASSWORD} #FashionStorePostgres
+  password: ${POSTGRES_PASSWORD}
 
 ---
 apiVersion: v1
