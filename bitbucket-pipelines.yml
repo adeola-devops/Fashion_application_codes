@@ -1,0 +1,164 @@
+max-time: 120
+
+definitions:
+  steps:
+    - step: &build-frontend
+        name: Build and Push Frontend Docker Image to aws ECR
+        environment: Development
+        runs-on: [self.hosted, linux.shell, devrunner]
+        # services:
+        #   - docker
+        script:
+          - set -e pipefail
+          - unset DOCKER_HOST
+          - echo "SonarQube scanning..."
+          - docker run --rm -e SONAR_HOST_URL="${SONAR_HOST_URL}" -e SONAR_TOKEN="${SONAR_TOKEN}" -v "$BITBUCKET_CLONE_DIR:/usr/src" sonarsource/sonar-scanner-cli -Dsonar.projectKey="${PROJECT_KEY}" -Dsonar.sources=app/frontend
+
+          - echo "gitleaks scanning..."
+          - gitleaks detect --source . --no-git --redact --verbose --exit-code 1
+
+          - echo "authenticating Docker with AWS"
+          - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+          - echo "Building frontend image..."
+          - export DOCKER_BUILDKIT=0
+          - docker build --no-cache --build-arg APP_VERSION=${BITBUCKET_TAG} -t ${AWS_ECR_FRONTEND_REPOSITORY_NAME}:${BITBUCKET_TAG} ./app/frontend
+
+          - echo "tagging image..."
+          - docker tag ${AWS_ECR_FRONTEND_REPOSITORY_NAME}:${BITBUCKET_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_FRONTEND_REPOSITORY_NAME}:${BITBUCKET_TAG}
+
+          - echo "trivy scanning..."
+          - trivy fs --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 .
+
+          - echo "pushing image to AWS_ECR register"
+          - docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_FRONTEND_REPOSITORY_NAME}:${BITBUCKET_TAG}
+
+
+    - step: &build-backend
+        name: Build and Push Backend Docker Image to aws ECR
+        environment: Development
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -e pipefail
+          - unset DOCKER_HOST
+          - echo "SonarQube scanning..."
+          - docker run --rm -e SONAR_HOST_URL="${SONAR_HOST_URL}" -e SONAR_TOKEN="${SONAR_TOKEN}" -v "$BITBUCKET_CLONE_DIR:/usr/src" sonarsource/sonar-scanner-cli -Dsonar.projectKey="${PROJECT_KEY}" -Dsonar.sources=app/backend
+
+          - echo "gitleaks scanning..."
+          - gitleaks detect --source . --no-git --redact --verbose --exit-code 1
+
+          - echo "authenticating Docker with AWS..."
+          - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+          - echo "Building backend image..."
+          - export DOCKER_BUILDKIT=0
+          - docker build --no-cache --build-arg APP_VERSION=${BITBUCKET_TAG} -t ${AWS_ECR_BACKEND_REPOSITORY_NAME}:${BITBUCKET_TAG} ./app/backend
+
+          - echo "tagging image..."
+          - docker tag ${AWS_ECR_BACKEND_REPOSITORY_NAME}:${BITBUCKET_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_BACKEND_REPOSITORY_NAME}:${BITBUCKET_TAG}
+
+          - echo "trivy scanning..."
+          - trivy fs --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 .
+
+          - echo "pushing image to AWS_ECR register..."
+          - docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_BACKEND_REPOSITORY_NAME}:${BITBUCKET_TAG}
+
+    - step: &deploy
+        name: Deploy to EKS
+        environment: Development
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -ex pipefail
+          - echo "Updating kubeconfig..."
+          - aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}
+
+          - echo "Deploying all resources..."
+          - envsubst < kubernetes/progress.yaml | kubectl apply -f -
+          - kubectl wait --for=condition=ready pod -l app=postgres -n fashion-store-project --timeout=120s # Wait for PostgreSQL to be ready
+
+          - echo "Initializing database..."
+          - kubectl apply -f kubernetes/postgres-init-job.yaml
+          - kubectl wait --for=condition=complete --timeout=120s job/db-init -n fashion-store-project # Wait for job to complete
+
+          - echo "Deploying backend and frontend..."
+          - envsubst < kubernetes/deployment.yaml | kubectl apply -f -
+
+          - echo "Deploying ingress..."
+          - envsubst < kubernetes/ingress.yaml | kubectl apply -f -
+
+          - echo "Updating deployments image with the new tag..."
+          - kubectl set image deployment/frontend-deployment -n fashion-store-project frontend-container=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_FRONTEND_REPOSITORY_NAME}:${BITBUCKET_TAG}
+          - kubectl set image deployment/backend-deployment -n fashion-store-project backend-container=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_BACKEND_REPOSITORY_NAME}:${BITBUCKET_TAG}
+
+          - echo "Annotating deployment..."
+          - kubectl annotate deployment/frontend-deployment -n fashion-store-project kubernetes.io/change-cause=${BITBUCKET_TAG}
+          - kubectl annotate deployment/backend-deployment -n fashion-store-project kubernetes.io/change-cause=${BITBUCKET_TAG}
+
+          - echo "Waiting for deployments..."
+          - kubectl rollout status deployment/backend-deployment -n fashion-store-project --timeout=120s
+          - kubectl rollout status deployment/frontend-deployment -n fashion-store-project --timeout=120s
+
+          - echo "Deployment complete!"
+          - kubectl get pods -n fashion-store-project
+          - kubectl get ingress -n fashion-store-project
+  
+
+    - step: &destroy
+        name: Destroy Environment
+        environment: Development
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}
+          - kubectl delete ns fashion-store-project --ignore-not-found
+          - echo "Environment destroyed"
+
+
+    - step: &trivy-scan
+        name: Trivy Scan
+        environment: Development
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - echo "Running Trivy scan"
+          - cd "$BITBUCKET_CLONE_DIR"
+          - trivy fs --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 .
+
+    - step: &gitleaks-scan
+        name: GitLeaks Secret Scan
+        environment: Development
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -e pipefail
+          - echo "Running GitLeaks secrets scan"
+          - cd "$BITBUCKET_CLONE_DIR"
+          - gitleaks detect --source . --no-git --redact --verbose --exit-code 1
+
+    - step: &SonarQube-scanner
+        name: SonarQube Analysis
+        environment: Development
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - cd "$BITBUCKET_CLONE_DIR"
+          - unset DOCKER_HOST
+          - docker run --rm -e SONAR_HOST_URL="${SONAR_HOST_URL}" -e SONAR_TOKEN="${SONAR_TOKEN}" -v "$BITBUCKET_CLONE_DIR:/usr/src" sonarsource/sonar-scanner-cli -Dsonar.projectKey="${PROJECT_KEY}" -Dsonar.sources=app
+pipelines:
+  tags:
+    "v*":
+      - step: *build-frontend
+      - step: *build-backend
+      - step: *deploy
+
+  branch:
+    feature/dev:
+      - step: *trivy-scan
+      - step: *gitleaks-scan
+      - step: *SonarQube-scanner
+
+  custom:
+    Security_Scanning:
+      - step: *trivy-scan
+      - step: *gitleaks-scan
+      - step: *SonarQube-scanner
+    app_destroy:
+      - step: *destroy
+    app_deployment:
+      - step: *deploy
